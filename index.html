@@ -1254,13 +1254,14 @@ function currentMonthStr(){
    `databaseURL` only appears once you have created a Realtime Database, so create that first.
    Leave these blank and the app falls back to this-browser-only storage, exactly as it behaved before. */
 const FIREBASE_CONFIG = {
-  apiKey: "",
-  authDomain: "",
-  databaseURL: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: ""
+  apiKey: "AIzaSyBB05qBLRpLJUPJ3KThKsu_t7nb4BXgYbY",
+  authDomain: "cer-duty-board.firebaseapp.com",
+  databaseURL: "https://cer-duty-board-default-rtdb.firebaseio.com",
+  projectId: "cer-duty-board",
+  storageBucket: "cer-duty-board.firebasestorage.app",
+  messagingSenderId: "286802283036",
+  appId: "1:286802283036:web:c8b314e149bbc26a7f2dd9",
+  measurementId: "G-343W3PQSSH"
 };
 /* Everything the app saves lives under this one node, so several sites can share one Firebase project. */
 const CLOUD_ROOT = "duty-board";
@@ -2208,12 +2209,13 @@ function renderAvailList(){
   listEl.querySelectorAll(".avail-row").forEach(row=>{
     const day = row.dataset.day;
     row.querySelectorAll(".status-toggle button").forEach(btn=>{
-      btn.addEventListener("click", ()=>{
+      btn.addEventListener("click", async ()=>{
         if(!state.availability[state.selectedAvailMember]) state.availability[state.selectedAvailMember] = {};
         state.availability[state.selectedAvailMember][day] = btn.dataset.status;
         row.querySelectorAll(".status-toggle button").forEach(b=>b.classList.remove("active"));
         btn.classList.add("active");
         renderAvailSearch();
+        await saveAvailability();
       });
     });
   });

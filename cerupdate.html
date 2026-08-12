@@ -2209,12 +2209,13 @@ function renderAvailList(){
   listEl.querySelectorAll(".avail-row").forEach(row=>{
     const day = row.dataset.day;
     row.querySelectorAll(".status-toggle button").forEach(btn=>{
-      btn.addEventListener("click", ()=>{
+      btn.addEventListener("click", async ()=>{
         if(!state.availability[state.selectedAvailMember]) state.availability[state.selectedAvailMember] = {};
         state.availability[state.selectedAvailMember][day] = btn.dataset.status;
         row.querySelectorAll(".status-toggle button").forEach(b=>b.classList.remove("active"));
         btn.classList.add("active");
         renderAvailSearch();
+        await saveAvailability();
       });
     });
   });
