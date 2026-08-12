@@ -63,12 +63,54 @@ Realtime Database → **Rules** tab → replace everything with this → **Publi
       "$record": {
         ".validate": "newData.isString() && newData.val().length <= 500000"
       }
+    },
+    "duty-board-dev": {
+      ".read": true,
+      ".write": true,
+      "$record": {
+        ".validate": "newData.isString() && newData.val().length <= 500000"
+      }
+    },
+    "secrets": {
+      "$env": {
+        "officer": {
+          ".write": true,
+          "hash": { ".read": false, ".validate": "newData.isString() && newData.val().matches(/^[0-9a-f]{64}$/)" },
+          "salt": { ".read": true, ".validate": "newData.isString() && newData.val().length <= 64" }
+        },
+        "members": {
+          "$memberId": {
+            ".write": true,
+            "hash": { ".read": false, ".validate": "newData.isString() && newData.val().matches(/^[0-9a-f]{64}$/)" },
+            "salt": { ".read": true, ".validate": "newData.isString() && newData.val().length <= 64" }
+          }
+        }
+      }
+    },
+    "unlock-attempts": {
+      "$env": {
+        "officer": {
+          ".read": false,
+          ".write": "newData.val() === root.child('secrets/' + $env + '/officer/hash').val()"
+        },
+        "members": {
+          "$memberId": {
+            ".read": false,
+            ".write": "newData.val() === root.child('secrets/' + $env + '/members/' + $memberId + '/hash').val()"
+          }
+        }
+      }
     }
   }
 }
 ```
 
 Test mode rules expire after 30 days and the site would silently stop saving, so don't skip this.
+
+The `duty-board-dev` block and the `secrets`/`unlock-attempts` trees are what make PIN checking
+happen on Firebase's servers instead of in the browser (see the caveat section below) — they're
+required even if you only ever use `duty-board` (production). `duty-board-dev` is only used by the
+`cerupdate-dev.html` sandbox copy for testing changes without touching live data.
 
 ## 5. Upload
 
@@ -110,15 +152,22 @@ Firebase's free Spark plan allows 100 simultaneous connections and 1 GB stored. 
 a few hundred KB at most and a squad will never approach 100 people with the page open at once.
 No card required.
 
-## One security caveat, so it isn't a surprise
+## How PIN checking works now
 
-The rules above let anyone who knows the site URL read and write the data. That is what makes
-the app work without accounts — members submit availability with no login.
+The rules above let anyone who knows the site URL read and write most of the data (the
+`duty-board`/`duty-board-dev` trees) — that's still what makes the app work without accounts,
+so members can submit availability with no login.
 
-The consequence: **the officer PIN and member PINs are readable** by anyone technical enough to
-open the database URL, and are stored as plain text. They keep honest people out of the officer
-tabs; they are not real security. Don't reuse a password that matters anywhere else.
+PINs are the exception. They're hashed in the browser (SHA-256, with a random salt per PIN)
+before anything is sent, and the actual match check happens inside the rules above, evaluated on
+Firebase's servers — the stored hash has `.read: false` and is never sent to any browser, ever.
+Checking a PIN attempt works by trying to write the computed hash to `unlock-attempts/...`; the
+rules only let that write through if it matches the real (unreadable) hash, so a successful write
+means "correct PIN" and a permission error means "wrong PIN." No PIN, and no PIN hash, ever
+appears in the app's network traffic.
 
-Closing that gap properly means moving the PIN check to a server (a Cloudflare Worker or Firebase
-Auth + Cloud Function), which is a larger change. Worth doing if this ever holds anything
-sensitive — say the word and I'll build it.
+One caveat worth knowing: *setting or changing* a PIN is still governed by the same open-write
+trust model as the rest of the app (anyone who can reach the site can already rewrite the roster
+today), so this closes the "PINs are readable off the wire" gap without adding real accounts.
+Locking down who's allowed to administer the board would be a separate, bigger project — worth
+doing if this ever holds something more sensitive than a duty roster.

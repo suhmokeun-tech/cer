@@ -1089,6 +1089,15 @@
         </div>
       </div>
       <div class="footer-actions">
+        <button class="primary" id="autoFillBtn">Auto-fill schedule</button>
+        <span class="save-flash" id="autoFillFlash"></span>
+        <label class="row" style="gap:6px;align-items:center;font-size:13px;color:var(--ink-dim);">
+          Max weekends/person
+          <select id="maxWeekendsSelect" style="width:60px;">
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+        </label>
         <button class="primary" id="saveScheduleBtn">Save schedule</button>
         <button class="ghost" id="exportBtn">Copy as text</button>
         <button class="ghost" id="clearScheduleBtn">Clear schedule</button>
@@ -1196,7 +1205,7 @@ let state = {
   tab: "availability",
   month: currentMonthStr(),
   roster: [],
-  monthConfig: { onDutyDays: [], slots: { Rescuer: 1, Trainee: 1 }, extraSlots: {} },
+  monthConfig: { onDutyDays: [], slots: { Rescuer: 1, Trainee: 1 }, extraSlots: {}, maxWeekendsPerPerson: 2 },
   availability: {},
   assignments: {},
   published: false,
@@ -1206,7 +1215,7 @@ let state = {
   selectedAvailMember: "",
   availUnlockedFor: null,
   availPinError: "",
-  officerPin: null,
+  officerPinSet: false,
   officerUnlocked: false,
   pinFormOpen: false,
   pinError: "",
@@ -1482,6 +1491,105 @@ async function storageList(prefix){
   return { keys };
 }
 
+/* ---------- PIN secrets (hashed, verified server-side) ----------
+   PINs live outside the flat key/value store above, at secrets/<CLOUD_ROOT>/... and
+   unlock-attempts/<CLOUD_ROOT>/.... Individual fields there need their own Firebase
+   Security Rules (hash unreadable, salt readable, unlock-attempts writable only on a
+   correct guess) — something a single JSON-blob-per-key can't express. See
+   SETUP-FIREBASE.md for the rules this depends on.
+   "kind" is "officer" or "member"; "id" is the member id (ignored for "officer"). */
+async function sha256Hex(str){
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function randomSaltHex(bytes){
+  const arr = new Uint8Array(bytes || 16);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function secretPath(kind, id){
+  return kind === "officer" ? `secrets/${CLOUD_ROOT}/officer` : `secrets/${CLOUD_ROOT}/members/${id}`;
+}
+function attemptPath(kind, id){
+  return kind === "officer" ? `unlock-attempts/${CLOUD_ROOT}/officer` : `unlock-attempts/${CLOUD_ROOT}/members/${id}`;
+}
+function mirrorSecretKey(kind, id){
+  return kind === "officer" ? "pin-secret:officer" : "pin-secret:member:" + id;
+}
+async function getPinSalt(kind, id){
+  if(cloudRef){
+    try{
+      const snap = await firebase.database().ref(secretPath(kind, id) + "/salt").once("value");
+      return snap.val();
+    }catch(error){
+      console.error("getPinSalt error", kind, id, error);
+      return null;
+    }
+  }
+  const mirrored = mirrorGet(mirrorSecretKey(kind, id));
+  if(!mirrored) return null;
+  try{ return JSON.parse(mirrored).salt; }catch(error){ return null; }
+}
+async function pinIsSet(kind, id){
+  return (await getPinSalt(kind, id)) != null;
+}
+async function setPinSecret(kind, id, pin){
+  const salt = randomSaltHex(16);
+  const hash = await sha256Hex(pin + salt);
+  if(cloudRef){
+    await firebase.database().ref(secretPath(kind, id)).set({ hash, salt });
+  }
+  mirrorSet(mirrorSecretKey(kind, id), JSON.stringify({ hash, salt }));
+}
+async function clearPinSecret(kind, id){
+  if(cloudRef){
+    try{ await firebase.database().ref(secretPath(kind, id)).remove(); }catch(error){ console.error("clearPinSecret error", error); }
+  }
+  mirrorSet(mirrorSecretKey(kind, id), null);
+}
+/* Verifies by attempting a write that Firebase's rules only allow through on a correct
+   guess — the match happens on Firebase's servers, and the real hash is never read by
+   this (or any) client. A resolved write means "correct"; PERMISSION_DENIED means "wrong". */
+async function verifyPinAttempt(kind, id, attempt){
+  const salt = await getPinSalt(kind, id);
+  if(salt == null) return false;
+  const attemptHash = await sha256Hex(attempt + salt);
+  if(!cloudRef){
+    const mirrored = mirrorGet(mirrorSecretKey(kind, id));
+    if(!mirrored) return false;
+    try{ return JSON.parse(mirrored).hash === attemptHash; }catch(error){ return false; }
+  }
+  try{
+    await firebase.database().ref(attemptPath(kind, id)).set(attemptHash);
+    return true;
+  }catch(error){
+    const denied = error && (error.code === "PERMISSION_DENIED" ||
+      /permission_denied/i.test(error.message || ""));
+    if(denied) return false;
+    throw error;
+  }
+}
+/* One-time upgrade: hash any pre-existing plaintext PINs found in the old storage
+   locations, then remove the plaintext. No-op once a database has been migrated. */
+async function migrateLegacyPins(){
+  const legacyOfficerPin = await storeGet("officer-pin");
+  if(legacyOfficerPin){
+    await setPinSecret("officer", null, legacyOfficerPin);
+    await storeDelete("officer-pin");
+  }
+  const roster = await storeGet("roster", true) || [];
+  let changed = false;
+  for(const m of roster){
+    if(typeof m.pin === "string" && m.pin){
+      await setPinSecret("member", m.id, m.pin);
+      delete m.pin;
+      m.hasPin = true;
+      changed = true;
+    }
+  }
+  if(changed) await storeSet("roster", roster, true);
+}
+
 /* A push from another browser. Debounced, and held off mid-drag so the calendar
    is not re-rendered out from under someone painting a date range. */
 let remoteChangeTimer = null;
@@ -1502,12 +1610,11 @@ document.addEventListener("visibilitychange", () => {
 });
 
 async function loadOfficerPin(){
-  const res = await storeGet("officer-pin");
-  state.officerPin = res != null ? res : null;
+  state.officerPinSet = await pinIsSet("officer");
 }
 async function saveOfficerPin(pin){
-  await storeSet("officer-pin", pin);
-  state.officerPin = pin;
+  await setPinSecret("officer", null, pin);
+  state.officerPinSet = true;
 }
 async function loadRoster(){
   state.roster = (await storeGet("roster", true)) || [];
@@ -1520,6 +1627,7 @@ async function loadMonthConfig(){
   state.monthConfig = cfg || { onDutyDays: [], slots: { Rescuer: 1, Trainee: 1 }, extraSlots: {}, dayTitles: {} };
   if(!state.monthConfig.extraSlots) state.monthConfig.extraSlots = {};
   if(!state.monthConfig.dayTitles) state.monthConfig.dayTitles = {};
+  if(!state.monthConfig.maxWeekendsPerPerson) state.monthConfig.maxWeekendsPerPerson = 2;
 }
 async function saveMonthConfig(){
   await storeSet("month-config:" + state.month, state.monthConfig, true);
@@ -1668,10 +1776,10 @@ function dayCode(ym, day){
 function memberById(id){
   return state.roster.find(m => m.id === id);
 }
-function flash(id){
+function flash(id, ms){
   const el = document.getElementById(id);
   el.classList.add("show");
-  setTimeout(()=>el.classList.remove("show"), 1400);
+  setTimeout(()=>el.classList.remove("show"), ms || 1400);
 }
 function getDayTitle(day){
   const titles = state.monthConfig.dayTitles || {};
@@ -1781,7 +1889,7 @@ function renderNavVisibility(){
 /* ---------- officer gate ---------- */
 function renderOfficerBar(){
   const bar = document.getElementById("officerBar");
-  if(state.officerPin === null){
+  if(!state.officerPinSet){
     bar.innerHTML = `
       <span>No officer PIN set yet — set one to unlock Roster, Set Up Month, and Build Schedule.</span>
       <input type="password" id="newPinInput" placeholder="Create PIN (4+ chars)">
@@ -1793,6 +1901,7 @@ function renderOfficerBar(){
       setBtn.addEventListener("click", async ()=>{
         const val = document.getElementById("newPinInput")?.value.trim() || "";
         if(val.length < 4){ state.pinError = "PIN must be at least 4 characters."; renderOfficerBar(); return; }
+        setBtn.disabled = true;
         try{
           await saveOfficerPin(val);
           state.officerUnlocked = true;
@@ -1822,18 +1931,28 @@ function renderOfficerBar(){
       `;
       const attemptInput = document.getElementById("pinAttempt");
       attemptInput.focus();
-      const tryUnlock = ()=>{
-        if(attemptInput.value === state.officerPin){
-          state.officerUnlocked = true;
-          state.pinFormOpen = false;
-          state.pinError = "";
-          switchTab("roster");
-        } else {
-          state.pinError = "Incorrect PIN.";
+      const submitBtn = document.getElementById("pinSubmit");
+      const tryUnlock = async ()=>{
+        const val = attemptInput.value;
+        submitBtn.disabled = true;
+        try{
+          const ok = await verifyPinAttempt("officer", null, val);
+          if(ok){
+            state.officerUnlocked = true;
+            state.pinFormOpen = false;
+            state.pinError = "";
+            switchTab("roster");
+          } else {
+            state.pinError = "Incorrect PIN.";
+            renderOfficerBar();
+          }
+        }catch(err){
+          console.error("PIN verification failed", err);
+          state.pinError = "Couldn't reach the server to check the PIN.";
           renderOfficerBar();
         }
       };
-      document.getElementById("pinSubmit").addEventListener("click", tryUnlock);
+      submitBtn.addEventListener("click", tryUnlock);
       attemptInput.addEventListener("keydown", e=>{ if(e.key==="Enter") tryUnlock(); });
       document.getElementById("pinCancel").addEventListener("click", ()=>{
         state.pinFormOpen = false;
@@ -1898,13 +2017,13 @@ function renderRoster(){
     return;
   }
   list.innerHTML = state.roster.map(m => {
-    const pinLabel = m.pin ? (state.officerUnlocked ? `PIN: ${escapeHtml(m.pin)}` : "🔒 PIN set") : "no PIN yet";
+    const pinLabel = m.hasPin ? "🔒 PIN set" : "no PIN yet";
     return `
     <div class="roster-item">
       <div><span class="name">${escapeHtml(m.name)}</span><span class="badge ${m.role.toLowerCase()}">${m.role}</span><span class="lock-tag">${pinLabel}</span></div>
       <div class="row" style="gap:8px;">
         <button class="ghost small" data-toggle="${m.id}">Switch to ${m.role==="Rescuer"?"Trainee":"Rescuer"}</button>
-        ${m.pin ? `<button class="ghost small" data-resetpin="${m.id}">Reset PIN</button>` : ""}
+        ${m.hasPin ? `<button class="ghost small" data-resetpin="${m.id}">Reset PIN</button>` : ""}
         <button class="danger" data-id="${m.id}">Remove</button>
       </div>
     </div>
@@ -1912,6 +2031,7 @@ function renderRoster(){
   }).join("");
   list.querySelectorAll("button.danger").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
+      await clearPinSecret("member", btn.dataset.id);
       state.roster = state.roster.filter(m=>m.id!==btn.dataset.id);
       await saveRoster();
       renderRoster();
@@ -1922,7 +2042,8 @@ function renderRoster(){
       const m = state.roster.find(x=>x.id===btn.dataset.resetpin);
       if(!m) return;
       if(!confirm(`Reset ${m.name}'s PIN? They'll set a new one next time they submit availability.`)) return;
-      m.pin = null;
+      await clearPinSecret("member", m.id);
+      m.hasPin = false;
       await saveRoster();
       renderRoster();
       flash("rosterFlash");
@@ -1944,7 +2065,7 @@ document.getElementById("addMemberBtn").addEventListener("click", async ()=>{
   const roleInput = document.getElementById("newMemberRole");
   const name = nameInput.value.trim();
   if(!name) return;
-  state.roster.push({ id: "m_"+Date.now()+"_"+Math.random().toString(36).slice(2,7), name, role: roleInput.value, pin: null });
+  state.roster.push({ id: "m_"+Date.now()+"_"+Math.random().toString(36).slice(2,7), name, role: roleInput.value, hasPin: false });
   nameInput.value = "";
   await saveRoster();
   renderRoster();
@@ -2147,7 +2268,7 @@ function renderAvailLock(){
     return;
   }
 
-  if(!m.pin){
+  if(!m.hasPin){
     area.innerHTML = `
       <div class="pin-gate">
         <span class="hint">First time, ${escapeHtml(m.name)}? Set a personal PIN so only you can edit your own availability.</span>
@@ -2155,15 +2276,24 @@ function renderAvailLock(){
         <button class="ghost small" id="setMemberPinBtn">Set PIN</button>
         ${state.availPinError ? `<span class="error">${state.availPinError}</span>` : ""}
       </div>`;
-    document.getElementById("setMemberPinBtn").addEventListener("click", async ()=>{
+    const setBtn = document.getElementById("setMemberPinBtn");
+    setBtn.addEventListener("click", async ()=>{
       const val = document.getElementById("setMemberPin").value.trim();
       if(val.length < 4){ state.availPinError = "PIN must be at least 4 characters."; renderAvailLock(); return; }
-      m.pin = val;
-      await saveRoster();
-      state.availUnlockedFor = m.id;
-      state.availPinError = "";
-      renderAvailLock();
-      renderAvailList();
+      setBtn.disabled = true;
+      try{
+        await setPinSecret("member", m.id, val);
+        m.hasPin = true;
+        await saveRoster();
+        state.availUnlockedFor = m.id;
+        state.availPinError = "";
+        renderAvailLock();
+        renderAvailList();
+      }catch(err){
+        console.error("Failed to save member PIN", err);
+        state.availPinError = "Unable to save PIN. Check your connection.";
+        renderAvailLock();
+      }
     });
   } else {
     area.innerHTML = `
@@ -2175,18 +2305,28 @@ function renderAvailLock(){
       </div>`;
     const input = document.getElementById("memberPinAttempt");
     input.focus();
-    const tryUnlock = ()=>{
-      if(input.value === m.pin){
-        state.availUnlockedFor = m.id;
-        state.availPinError = "";
-        renderAvailLock();
-        renderAvailList();
-      } else {
-        state.availPinError = "Incorrect PIN.";
+    const unlockBtn = document.getElementById("memberPinBtn");
+    const tryUnlock = async ()=>{
+      const val = input.value;
+      unlockBtn.disabled = true;
+      try{
+        const ok = await verifyPinAttempt("member", m.id, val);
+        if(ok){
+          state.availUnlockedFor = m.id;
+          state.availPinError = "";
+          renderAvailLock();
+          renderAvailList();
+        } else {
+          state.availPinError = "Incorrect PIN.";
+          renderAvailLock();
+        }
+      }catch(err){
+        console.error("PIN verification failed", err);
+        state.availPinError = "Couldn't reach the server to check the PIN.";
         renderAvailLock();
       }
     };
-    document.getElementById("memberPinBtn").addEventListener("click", tryUnlock);
+    unlockBtn.addEventListener("click", tryUnlock);
     input.addEventListener("keydown", e=>{ if(e.key==="Enter") tryUnlock(); });
   }
 }
@@ -2347,7 +2487,7 @@ document.getElementById("submitAvailBtn").addEventListener("click", async ()=>{
 document.getElementById("clearMonthBtn").addEventListener("click", async ()=>{
   if(!confirm("Clear month setup for this month? This will remove on-duty days and slot configuration.")) return;
   await storeDelete("month-config:" + state.month, true);
-  state.monthConfig = { onDutyDays: [], slots: { Rescuer: 1, Trainee: 1 }, extraSlots: {}, dayTitles: {} };
+  state.monthConfig = { onDutyDays: [], slots: { Rescuer: 1, Trainee: 1 }, extraSlots: {}, dayTitles: {}, maxWeekendsPerPerson: 2 };
   await saveMonthConfig();
   renderSetup();
   flash("setupFlash");
@@ -2424,6 +2564,8 @@ function buildWeeks(total, offset){
 function renderSchedule(){
   document.getElementById("scheduleMonthLabel").textContent = monthLabel(state.month);
   renderPublishStatusTag();
+  const weekendSelect = document.getElementById("maxWeekendsSelect");
+  if(weekendSelect) weekendSelect.value = String(state.monthConfig.maxWeekendsPerPerson || 2);
   const grid = document.getElementById("scheduleGrid");
   if(state.monthConfig.onDutyDays.length===0){
     grid.innerHTML = '<tbody><tr><td colspan="8" style="border:none;padding:30px 0;"><div class="empty-state">No on-duty days set for this month yet — check Set Up Month.</div></td></tr></tbody>';
@@ -2641,6 +2783,33 @@ document.getElementById("unpublishScheduleBtn").addEventListener("click", async 
 });
 document.getElementById("clearScheduleBtn").addEventListener("click", async ()=>{
   await clearSchedule();
+});
+document.getElementById("autoFillBtn").addEventListener("click", async ()=>{
+  const btn = document.getElementById("autoFillBtn");
+  const resultEl = document.getElementById("autoFillFlash");
+  btn.disabled = true;
+  try{
+    const result = await generateAutoSchedule();
+    // Save right away: a native alert() steals window focus, and regaining focus triggers
+    // this app's "reload everything from Firebase" listener — which would silently wipe an
+    // unsaved in-memory fill before anyone got to see it. Saving first makes that safe.
+    if(result.filled > 0) await saveAssignments();
+    renderSchedule();
+    if(result.filled === 0 && result.skipped === 0){
+      resultEl.textContent = "Nothing to fill — every slot already has a manual pick, or there are no on-duty days set.";
+    } else {
+      let msg = `Filled ${result.filled} shift${result.filled===1?"":"s"} and saved.`;
+      if(result.skipped > 0) msg += ` ${result.skipped} slot${result.skipped===1?"":"s"} left empty (no one eligible/available) — fill manually.`;
+      resultEl.textContent = msg;
+    }
+    flash("autoFillFlash", 6000);
+  } finally {
+    btn.disabled = false;
+  }
+});
+document.getElementById("maxWeekendsSelect").addEventListener("change", async (e)=>{
+  state.monthConfig.maxWeekendsPerPerson = Number(e.target.value) || 2;
+  await saveMonthConfig();
 });
 function populatePublishedViewerSelect(){
   const sel = document.getElementById("publishedViewerSelect");
@@ -2869,6 +3038,106 @@ function tallyMonthAssignments(assignments){
     });
   });
   return counts;
+}
+/* All-time shift totals from published history, excluding the given month (used by the
+   auto-fill scheduler for long-term fairness — separate from the Stats tab's cumulative
+   view, which is filtered by a user-configurable date range that shouldn't bias who gets
+   picked for a shift). */
+async function computeAllTimeShiftTotals(excludeMonth){
+  const keys = await getArchiveAssignmentKeys();
+  const totals = {};
+  state.roster.forEach(m=>{ totals[m.id] = 0; });
+  const seenMonths = new Set();
+  for(const k of keys){
+    const monthKey = k.includes("published-archive:") ? k.replace("published-archive:","") : k.replace("assignments:","");
+    if(monthKey === excludeMonth || seenMonths.has(monthKey)) continue;
+    seenMonths.add(monthKey);
+    const raw = await storeGet(k, true);
+    if(!raw) continue;
+    const assignments = raw.assignments !== undefined ? raw.assignments : raw;
+    const monthTally = tallyMonthAssignments(assignments);
+    state.roster.forEach(m=>{ totals[m.id] += monthTally[m.id] || 0; });
+  }
+  return totals;
+}
+function shuffledRoster(){
+  const arr = state.roster.slice();
+  for(let i = arr.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+/* Greedy fairness-based auto-fill: only touches empty slots, never overwrites a manual
+   pick. Day by day, role by role, slot by slot, prefers "yes" over "maybe", never
+   double-books a person same-day, never assigns back-to-back calendar days, softly
+   prefers people under the weekend cap, and among remaining candidates picks whoever has
+   the fewest shifts (this month's running count + all-time total). */
+async function generateAutoSchedule(){
+  const days = [...state.monthConfig.onDutyDays].sort((a,b)=>a-b);
+  if(days.length === 0) return { filled: 0, skipped: 0 };
+  const allTimeTotals = await computeAllTimeShiftTotals(state.month);
+  const pool = shuffledRoster();
+  const maxWeekends = Number(state.monthConfig.maxWeekendsPerPerson) || 2;
+  const monthShifts = {}, weekendShifts = {}, assignedDaysByMember = {};
+  state.roster.forEach(m=>{
+    monthShifts[m.id] = 0;
+    weekendShifts[m.id] = 0;
+    assignedDaysByMember[m.id] = new Set();
+  });
+  // Seed running counts from any slots already manually filled, so auto-fill stays fair
+  // relative to picks that are already on the board.
+  days.forEach(d=>{
+    const dayAssignment = state.assignments[d] || {};
+    const isWeekend = (dayOfWeek(state.month, d) === 5 || dayOfWeek(state.month, d) === 6);
+    ["Rescuer","Trainee"].forEach(role=>{
+      (dayAssignment[role] || []).forEach(id=>{
+        if(!id || !(id in monthShifts)) return;
+        monthShifts[id]++;
+        if(isWeekend) weekendShifts[id]++;
+        assignedDaysByMember[id].add(d);
+      });
+    });
+  });
+  const isAssignedOn = (id, d) => assignedDaysByMember[id].has(d);
+  let filled = 0, skipped = 0;
+  days.forEach(day=>{
+    const isWeekend = (dayOfWeek(state.month, day) === 5 || dayOfWeek(state.month, day) === 6);
+    ["Rescuer","Trainee"].forEach(role=>{
+      const slotCount = slotsForDay(day, role);
+      for(let idx=0; idx<slotCount; idx++){
+        if(!state.assignments[day]) state.assignments[day] = {};
+        if(!state.assignments[day][role]) state.assignments[day][role] = [];
+        if(state.assignments[day][role][idx]) continue; // manual pick — leave it alone
+
+        const eligible = pool.filter(m =>
+          m.role === role &&
+          !isAssignedOn(m.id, day) &&
+          !isAssignedOn(m.id, day - 1)
+        );
+        const yesPool = eligible.filter(m => statusFor(day, m.id) === "yes");
+        const maybePool = eligible.filter(m => statusFor(day, m.id) === "maybe");
+        const availPool = yesPool.length ? yesPool : maybePool;
+        if(availPool.length === 0){ skipped++; continue; }
+
+        let candidates = availPool;
+        if(isWeekend){
+          const underCap = availPool.filter(m => weekendShifts[m.id] < maxWeekends);
+          if(underCap.length) candidates = underCap;
+        }
+        candidates = candidates.slice().sort((a,b)=>
+          (monthShifts[a.id] + allTimeTotals[a.id]) - (monthShifts[b.id] + allTimeTotals[b.id])
+        );
+        const chosen = candidates[0];
+        state.assignments[day][role][idx] = chosen.id;
+        monthShifts[chosen.id]++;
+        if(isWeekend) weekendShifts[chosen.id]++;
+        assignedDaysByMember[chosen.id].add(day);
+        filled++;
+      }
+    });
+  });
+  return { filled, skipped };
 }
 async function computeCumulativeStats(){
   const keys = await getArchiveAssignmentKeys();
@@ -3111,12 +3380,13 @@ async function boot(){
   await loadSettings();
   await loadCumulativeRange();
   applySettings();
+  await migrateLegacyPins();
   await loadOfficerPin();
   await loadRoster();
   await loadAllForMonth();
   await populateSavedMonthsDropdown();
   renderOfficerBar();
-  switchTab(state.officerPin === null ? "roster" : "availability");
+  switchTab(state.officerPinSet ? "availability" : "roster");
   // Updates now arrive by push from the database listener; this is only a safety net.
   setInterval(()=>{
     if(document.visibilityState === "visible" && !cloudRef) refreshFromStorage();
