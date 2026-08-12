@@ -3374,6 +3374,10 @@ document.getElementById("clearCumulativeRangeBtn").addEventListener("click", asy
 /* ---------- boot ---------- */
 async function boot(){
   document.getElementById("brandLogo").src = LOGO_DATA_URI;
+  const favicon = document.createElement("link");
+  favicon.rel = "icon";
+  favicon.href = LOGO_DATA_URI;
+  document.head.appendChild(favicon);
   // Nothing renders until the shared database has answered, so no one sees stale data flash first.
   const online = await initCloud();
   if(online) await migrateMirrorToCloud();
