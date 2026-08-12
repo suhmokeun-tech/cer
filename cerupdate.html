@@ -1275,6 +1275,7 @@ let cloudCache = {};            // key -> raw string, the authoritative in-memor
 let cloudReady = null;          // resolves once the first snapshot has landed
 let cloudFirstSnapshot = false;
 let mirrorPruneOk = false;      // stays false until the migration prompt has been resolved
+let pendingWriteCount = 0;      // writes still in flight — server snapshots can lag behind these
 
 /* RTDB keys may not contain . $ # [ ] / — percent-encoding covers all of them. */
 function keyToPath(key){
@@ -1363,6 +1364,19 @@ function initCloud(){
         const v = raw[path];
         if(v !== null && v !== undefined) next[pathToKey(path)] = String(v);
       });
+      if(!cloudFirstSnapshot){
+        cloudFirstSnapshot = true;
+        cloudCache = next;
+        Object.keys(next).forEach(k => mirrorSet(k, next[k]));
+        done(true);
+        return;
+      }
+      if(pendingWriteCount > 0){
+        // A write we started hasn't been acknowledged yet, so this snapshot may still be
+        // missing it — applying it now would revert our own in-progress edits. The snapshot
+        // that arrives once every pending write settles will be fully caught up.
+        return;
+      }
       const changed = !sameCache(cloudCache, next);
       cloudCache = next;
       Object.keys(next).forEach(k => mirrorSet(k, next[k]));
@@ -1370,10 +1384,7 @@ function initCloud(){
         // Drop mirrored records the database no longer has, so deletes propagate to this browser too.
         mirrorKeys().filter(k => isAppKey(k) && !(k in next)).forEach(k => mirrorSet(k, null));
       }
-      if(!cloudFirstSnapshot){
-        cloudFirstSnapshot = true;
-        done(true);
-      }else if(changed){
+      if(changed){
         // `changed` is false for the echo of our own write, since storeSet already
         // updated cloudCache — that keeps clicking a day from re-rendering the grid.
         onRemoteChange();
@@ -1437,6 +1448,7 @@ async function storeSet(key, value, json){
     return true;
   }
   setSyncStatus("syncing");
+  pendingWriteCount++;
   try{
     await cloudRef.child(keyToPath(key)).set(raw);
     setSyncStatus("live");
@@ -1445,12 +1457,15 @@ async function storeSet(key, value, json){
     console.error("storeSet error", key, error);
     setSyncStatus("offline");
     throw error;
+  }finally{
+    pendingWriteCount--;
   }
 }
 async function storeDelete(key){
   delete cloudCache[key];
   mirrorSet(key, null);
   if(!cloudRef) return true;
+  pendingWriteCount++;
   try{
     await cloudRef.child(keyToPath(key)).remove();
     return true;
@@ -1458,6 +1473,8 @@ async function storeDelete(key){
     console.error("storeDelete error", key, error);
     setSyncStatus("offline");
     return false;
+  }finally{
+    pendingWriteCount--;
   }
 }
 async function storageList(prefix){
